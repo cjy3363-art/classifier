@@ -33,6 +33,19 @@ DEFAULT_MODEL = os.environ.get("GEMINI_MODEL", "").strip() or "gemini-3.8-flash"
 MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._\-]{0,63}$")
 ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 TIMEOUT = 60
+# «생각(thinking)» 수준. 3.x 모델은 기본으로 생각을 켜고 답해서, 분류 10건에도 60초를 넘길 수 있다.
+#   출처: https://aistudio.google.com/docs/thinking (2026-11-06 확인)
+#     gemini-3.8-flash 기본 medium · 쓸 수 있는 값 low/medium/high (minimal 은 오류)
+#     gemini-3.6-flash 기본 medium · gemini-3-flash-preview 기본 high — 둘 다 minimal 가능
+#     «Simple tasks: Use minimal thinking for ... classification»
+#   표에 없는 모델(Lite·직접 입력)은 보내지 않고 모델 기본값에 맡긴다.
+#   문서의 REST 예시는 Interactions API 뿐이라 generateContent 의 필드 이름은 확인하지 못했다 —
+#   그래서 400 이 나면 생각 설정을 빼고 한 번 더 부른다(call_gemini).
+THINKING = {
+    "gemini-3.8-flash": "low",
+    "gemini-3.6-flash": "minimal",
+    "gemini-3-flash-preview": "minimal",
+}
 MAX_TEXTS = 20
 MAX_LEN = 400
 
@@ -82,16 +95,28 @@ def is_timeout(e):
     return isinstance(e, urllib.error.URLError) and isinstance(getattr(e, "reason", None), TimeoutError)
 
 
-def call_gemini(key, model, prompt):
-    body = json.dumps({
-        "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"temperature": 0, "responseMimeType": "application/json"},
-    }).encode("utf-8")
+def _post(key, model, gen):
+    body = json.dumps({"contents": [{"parts": [{"text": gen.pop("_prompt")}]}],
+                       "generationConfig": gen}).encode("utf-8")
     req = urllib.request.Request(
         ENDPOINT.format(model=model), data=body, method="POST",
         headers={"Content-Type": "application/json", "x-goog-api-key": key})
     with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
-        data = json.loads(r.read().decode("utf-8"))
+        return json.loads(r.read().decode("utf-8"))
+
+
+def call_gemini(key, model, prompt):
+    gen = {"_prompt": prompt, "temperature": 0, "responseMimeType": "application/json"}
+    level = THINKING.get(model)
+    if level:
+        try:
+            data = _post(key, model, dict(gen, thinkingConfig={"thinkingLevel": level}))
+        except urllib.error.HTTPError as e:
+            if e.code != 400:
+                raise
+            data = _post(key, model, dict(gen))  # 생각 설정을 못 알아들으면 빼고 다시
+    else:
+        data = _post(key, model, dict(gen))
     text = data["candidates"][0]["content"]["parts"][0]["text"]
     return json.loads(text)
 
